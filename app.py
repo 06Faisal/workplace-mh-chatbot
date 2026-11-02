@@ -6,6 +6,7 @@ import os
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
+from decimal import Decimal
 from functools import wraps
 from pathlib import Path
 
@@ -16,10 +17,21 @@ import engine
 
 BASE = Path(__file__).resolve().parent
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 HOSTED = bool(os.environ.get("VERCEL"))
-# ponytail: Vercel only allows writes to /tmp, per instance and wiped on restart.
-# Real persistence needs a hosted database (Postgres/Turso) instead of SQLite.
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+if HOSTED and not os.environ.get("SECRET_KEY"):
+    print("WARNING: SECRET_KEY is not set, so logins will break between server instances.")
+# Hosted: set DATABASE_URL (e.g. Neon Postgres) so every server instance shares one database.
+# Local: falls back to a SQLite file. Vercel's /tmp is per instance and wiped on restart.
+DB_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+PG = bool(DB_URL)
+if PG:
+    import psycopg
+    IntegrityErrors = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    IntegrityErrors = (sqlite3.IntegrityError,)
+    if HOSTED:
+        print("WARNING: DATABASE_URL is not set, using temporary per-instance SQLite in /tmp.")
 app.config["DATABASE"] = os.environ.get("DATABASE") or ("/tmp/wellbeing.db" if HOSTED else str(BASE / "instance" / "wellbeing.db"))
 app.config.update(SESSION_COOKIE_SECURE=HOSTED, SESSION_COOKIE_SAMESITE="Lax")
 MIN_GROUP = 3  # admin stats hide any group with fewer distinct employees (k-anonymity)
@@ -70,6 +82,81 @@ CREATE TABLE IF NOT EXISTS warnings (
 CREATE INDEX IF NOT EXISTS ix_assess_user_time ON assessments(user_id, created_at);
 CREATE INDEX IF NOT EXISTS ix_msg_user_time ON messages(user_id, created_at);
 """
+# Same schema for Postgres: SERIAL ids, no PRAGMA. Timestamps stay as 'YYYY-MM-DD HH:MM:SS' text.
+PG_SCHEMA = (SCHEMA.replace("PRAGMA foreign_keys = ON;", "")
+             .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+             .replace("confidence REAL", "confidence DOUBLE PRECISION"))
+
+# Week label 'YYYY-Wnn' (Monday-first weeks, like SQLite's %W) in each dialect.
+WEEK = ("(substr(created_at,1,4) || '-W' || lpad(((extract(doy from created_at::timestamp)::int + 7 "
+        "- extract(isodow from created_at::timestamp)::int) / 7)::text, 2, '0'))") if PG else "strftime('%Y-W%W', created_at)"
+
+
+class Row(tuple):
+    """Postgres row that behaves like sqlite3.Row: r[0], r["col"], dict(r), tuple unpacking."""
+    def __new__(cls, values, cols):
+        r = super().__new__(cls, values)
+        r._cols = cols
+        return r
+
+    def keys(self):
+        return self._cols
+
+    def __getitem__(self, k):
+        return tuple.__getitem__(self, self._cols.index(k) if isinstance(k, str) else k)
+
+
+class PgCursor:
+    def __init__(self, cur, returning):
+        self._cur = cur
+        self._cols = [d.name for d in cur.description] if cur.description else []
+        self.lastrowid = cur.fetchone()[0] if returning else None
+
+    def _row(self, values):
+        # AVG/ROUND come back as Decimal; JSON and templates expect plain numbers
+        return Row([float(v) if isinstance(v, Decimal) else v for v in values], self._cols)
+
+    def fetchone(self):
+        r = self._cur.fetchone() if self._cols else None
+        return self._row(r) if r is not None else None
+
+    def fetchall(self):
+        return [self._row(r) for r in self._cur.fetchall()] if self._cols else []
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class PgConn:
+    """Thin adapter so the app's sqlite3-style calls (?, lastrowid, executescript) run on Postgres."""
+    def __init__(self, url):
+        # prepare_threshold=None: works through Neon/pgbouncer connection poolers
+        self._c = psycopg.connect(url, prepare_threshold=None)
+
+    def execute(self, sql, params=()):
+        sql = sql.replace("?", "%s")
+        returning = sql.lstrip().upper().startswith("INSERT")
+        if returning:
+            sql += " RETURNING id"
+        try:
+            return PgCursor(self._c.execute(sql, params), returning)
+        except Exception:
+            self._c.rollback()  # keep the connection usable after e.g. a duplicate email
+            raise
+
+    def executemany(self, sql, seq):
+        for params in seq:
+            self.execute(sql, params)
+
+    def executescript(self, script):
+        self._c.execute(script)
+        self._c.commit()
+
+    def commit(self):
+        self._c.commit()
+
+    def close(self):
+        self._c.close()
 
 
 def now():
@@ -77,6 +164,8 @@ def now():
 
 
 def db():
+    if "db" not in g and PG:
+        g.db = PgConn(DB_URL)
     if "db" not in g:
         Path(app.config["DATABASE"]).parent.mkdir(exist_ok=True)
         g.db = sqlite3.connect(app.config["DATABASE"])
@@ -94,7 +183,7 @@ def close_db(_):
 
 def init_db():
     with app.app_context():
-        db().executescript(SCHEMA)
+        db().executescript(PG_SCHEMA if PG else SCHEMA)
 
 
 # ---------- auth / security helpers ----------
@@ -110,6 +199,8 @@ def login_required(role=None):
         def wrapper(*a, **kw):
             u = current_user()
             if not u:
+                if request.path.startswith("/api/"):  # fetch() callers need JSON, not a login-page redirect
+                    return jsonify(error="Your session has expired. Please log in again.", login=True), 401
                 return redirect(url_for("login", next=request.path))
             if role and u["role"] != role:
                 abort(403)
@@ -125,6 +216,8 @@ def csrf_protect():
     if request.method == "POST":
         token = request.form.get("csrf") or request.headers.get("X-CSRF")
         if token != session["csrf"]:
+            if request.path.startswith("/api/"):
+                return jsonify(error="Your session has expired. Please log in again.", login=True), 400
             abort(400, "Invalid CSRF token")
 
 
@@ -173,7 +266,7 @@ def register():
                 db().commit()
                 flash("Account created. Please log in.", "success")
                 return redirect(url_for("login"))
-            except sqlite3.IntegrityError:
+            except IntegrityErrors:
                 flash("That email is already registered.", "danger")
     return render_template("register.html")
 
@@ -317,13 +410,13 @@ def evaluate_warnings(uid):
 @login_required("employee")
 def api_trends():
     uid, conn = g.user["id"], db()
-    q = lambda sql: [dict(r) for r in conn.execute(sql, (uid,))]
+    q = lambda sql, *a: [dict(r) for r in conn.execute(sql, (uid, *a))]
     return jsonify(
-        daily=q("SELECT date(created_at) AS period, ROUND(AVG(stress_level),2) AS avg, COUNT(*) AS n FROM assessments "
-                "WHERE user_id=? AND created_at>=date('now','localtime','-60 day') GROUP BY period ORDER BY period"),
-        weekly=q("SELECT strftime('%Y-W%W', created_at) AS period, ROUND(AVG(stress_level),2) AS avg, COUNT(*) AS n "
+        daily=q("SELECT substr(created_at,1,10) AS period, ROUND(AVG(stress_level),2) AS avg, COUNT(*) AS n "
+                "FROM assessments WHERE user_id=? AND created_at>=? GROUP BY period ORDER BY period", days_ago(60)[:10]),
+        weekly=q(f"SELECT {WEEK} AS period, ROUND(AVG(stress_level),2) AS avg, COUNT(*) AS n "
                  "FROM assessments WHERE user_id=? GROUP BY period ORDER BY period"),
-        monthly=q("SELECT strftime('%Y-%m', created_at) AS period, ROUND(AVG(stress_level),2) AS avg, COUNT(*) AS n "
+        monthly=q("SELECT substr(created_at,1,7) AS period, ROUND(AVG(stress_level),2) AS avg, COUNT(*) AS n "
                   "FROM assessments WHERE user_id=? GROUP BY period ORDER BY period"),
         categories=q("SELECT category, COUNT(*) AS n FROM assessments WHERE user_id=? GROUP BY category ORDER BY n DESC"),
         open_warnings=conn.execute("SELECT COUNT(*) FROM warnings WHERE user_id=? AND acknowledged=0", (uid,)).fetchone()[0],
@@ -349,7 +442,7 @@ def api_admin_stats():
             one("SELECT COUNT(DISTINCT user_id) FROM warnings WHERE acknowledged=0")),
         categories=rows("SELECT category, COUNT(*) AS n FROM assessments GROUP BY category "
                         "HAVING COUNT(DISTINCT user_id) >= ? ORDER BY n DESC", MIN_GROUP),
-        weekly=rows("SELECT strftime('%Y-W%W', created_at) AS period, ROUND(AVG(stress_level),2) AS avg "
+        weekly=rows(f"SELECT {WEEK} AS period, ROUND(AVG(stress_level),2) AS avg "
                     "FROM assessments GROUP BY period HAVING COUNT(DISTINCT user_id) >= ? ORDER BY period", MIN_GROUP),
         departments=rows("SELECT u.department AS department, ROUND(AVG(a.stress_level),2) AS avg "
                          "FROM assessments a JOIN users u ON u.id=a.user_id WHERE u.department<>'' "
@@ -357,10 +450,17 @@ def api_admin_stats():
     )
 
 
-init_db()
-if HOSTED:  # fresh /tmp on every cold start, so rebuild the demo accounts
-    import seed
-    seed.seed(demo=True)
+def _startup():
+    try:
+        init_db()
+        if HOSTED:  # create the admin/demo accounts if this database doesn't have them yet
+            import seed
+            seed.seed(demo=True)
+    except IntegrityErrors:
+        pass  # another server instance seeded at the same moment
+
+
+_startup()
 
 if __name__ == "__main__":
     app.run(debug=os.environ.get("FLASK_DEBUG") == "1")

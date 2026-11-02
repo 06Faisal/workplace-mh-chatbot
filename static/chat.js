@@ -60,9 +60,15 @@ document.getElementById('chatForm').onsubmit = async (e) => {
       headers: { 'Content-Type': 'application/json', 'X-CSRF': csrf },
       body: JSON.stringify({ message: text, self_rating: rate.value === '0' ? null : rate.value }),
     });
-    const data = await res.json();
+    let data = {};
+    try { data = await res.json(); } catch { /* server sent HTML, e.g. an error page */ }
     typing.remove();
-    if (!res.ok) return add('bot', data.error || 'Something went wrong.');
+    if (res.status === 401 || data.login) {
+      add('bot', data.error || 'Your session has expired. Please log in again.');
+      setTimeout(() => { window.location.href = '/login?next=/chat'; }, 1500);
+      return;
+    }
+    if (!res.ok) return add('bot', data.error || `Server error (${res.status}). Please try again.`);
     if (data.crisis) return add('bot', data.reply, 'crisis');
     insight(add('bot', data.reply), data.detection, data.recommendations, data.disclaimer);
     data.warnings.forEach((w) => add('bot', `Early warning: ${w} See your Alerts page.`, 'warn'));

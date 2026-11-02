@@ -7,6 +7,7 @@ Demo logins (test data only):  admin@mindwork.local / Admin@1234
                                asha@demo.local ... / Demo@1234
 """
 import csv
+import os
 import random
 import sys
 from datetime import datetime, timedelta
@@ -32,7 +33,8 @@ def add_user(name, email, pw, role="employee", dept=""):
 def seed(demo):
     random.seed(1)
     with app.app_context():
-        add_user("Admin", "admin@mindwork.local", "Admin@1234", role="admin")
+        # On a public deployment, set ADMIN_PASSWORD so the admin login isn't the published default
+        add_user("Admin", "admin@mindwork.local", os.environ.get("ADMIN_PASSWORD") or "Admin@1234", role="admin")
         if demo:
             with (BASE / "dataset" / "workplace_stress.csv").open(encoding="utf-8") as f:
                 samples = {}

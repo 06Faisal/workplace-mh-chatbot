@@ -97,11 +97,19 @@ Open http://127.0.0.1:5000.
 
 Asha and Neha have a *rising* trend, which triggers early warnings. You can also register a new employee. For a real deployment, set a fixed `SECRET_KEY` environment variable and change the admin password.
 
-## Live demo (Vercel)
+## Deploying on Vercel
 
-https://workplace-mh-chatbot.vercel.app
+Locally the app uses a SQLite file. On Vercel it needs a shared Postgres database, because each Vercel server instance has its own temporary `/tmp`, so SQLite there loses accounts and breaks logins between instances.
 
-Vercel only allows writes to `/tmp`, separately for each server instance, and clears it on restart. So the hosted site rebuilds the demo data on every cold start, and registered accounts and chats there are **temporary**. Run it locally for permanent SQLite storage, or move to a hosted database for real use. Set `SECRET_KEY` as a Vercel environment variable so logins survive restarts.
+Set these environment variables in the Vercel project (Settings → Environment Variables), then redeploy:
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | Postgres connection string. Easiest: Storage → Create Database → **Neon** (free), which sets it for you. |
+| `SECRET_KEY` | Any long random string, e.g. `python -c "import secrets;print(secrets.token_hex(32))"`. Keeps logins valid across instances. |
+| `ADMIN_PASSWORD` | Password for `admin@mindwork.local` (otherwise it is the public default `Admin@1234`). |
+
+On first start the app creates the tables and the admin and demo accounts. Accounts and chats then persist.
 
 ## Dataset and model results
 
