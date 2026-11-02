@@ -225,7 +225,7 @@ def csrf_protect():
 def inject():
     u = current_user()
     ctx = {"user": u, "csrf": session.get("csrf"), "LABELS": engine.LABELS, "unread": 0, "streak": 0,
-           "hosted": HOSTED}
+           "hosted": HOSTED, "persistent": PG}
     if u and u["role"] == "employee":
         ctx["unread"] = db().execute("SELECT COUNT(*) FROM warnings WHERE user_id=? AND acknowledged=0",
                                      (u["id"],)).fetchone()[0]
